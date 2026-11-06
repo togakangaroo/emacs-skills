@@ -28,6 +28,7 @@
         "./skills/mermaid",
         "./skills/open",
         "./skills/plantuml",
+        "./skills/pr-code-review-org",
         "./skills/select",
         "./skills/swiftui-preview",
         "./skills/xcode-build-device",

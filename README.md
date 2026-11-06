@@ -43,6 +43,10 @@ Plot data from the current context using matplotlib (via `uv run`). Queries the 
 
 Analyze a GitHub project's recent activity (PRs and issues) and produce a succinct, chart-backed health report — throughput, backlog burn-rate, and responsiveness. Renders matplotlib charts inline.
 
+### /pr-code-review-org
+
+Build an Emacs org document of a GitHub pull request's code changes for review. Each file and hunk is a heading; hunks link to the local checkout and show a diff block. Optionally adds short Haiku-written summaries to larger files and hunks.
+
 ### /plantuml
 
 Create diagrams from the current context using PlantUML. Applies the Emacs foreground color via `skinparam` for readable text on your Emacs background.
