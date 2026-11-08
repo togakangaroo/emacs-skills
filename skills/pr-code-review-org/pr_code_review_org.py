@@ -22,7 +22,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date
+from functools import cache
 from pathlib import Path
+from typing import Final
 
 ENRICH_MODEL = "claude-haiku-5-5"
 SUMMARY_THRESHOLD = 10
@@ -148,8 +150,9 @@ def render(meta: dict[str, object], files: list[ChangedFile], root: Path) -> str
             )
     return "".join(parts)
 
+_needs_attention_token: Final[str] = '<<<<NEEDS ATTENTION>>>'
 
-def enrich_prompt(org_path: Path, files: list[ChangedFile]) -> str:
+def summary_prompt(org_path: Path, files: list[ChangedFile]) -> str:
     file_targets = [f for f in files if f.changed > SUMMARY_THRESHOLD]
     hunk_targets = [
         (changed_file, hunk)
@@ -190,22 +193,38 @@ def keeps_lines(before: list[str], after: list[str]) -> bool:
     return all(any(line == candidate for candidate in remaining) for line in before)
 
 
-def enrich(org_path: Path, files: list[ChangedFile]) -> None:
-    needs_summary = [f for f in files if f.changed > SUMMARY_THRESHOLD] + [
+@cache
+def claude_path() -> str:
+    path = shutil.which("claude")
+    if path is None:
+        sys.exit("claude CLI not found on PATH; rerun with --no-enrich or install Claude Code")
+    return path
+
+
+def claude(prompt: str, *allowed_tools: str) -> str:
+    prompt += f"""
+    If the operation fails or gets confusing simply reply with the following token: {_needs_attention_token}
+    """.lstrip()
+    args = [claude_path(), "-p", "--model", ENRICH_MODEL]
+    if allowed_tools:
+        args += ["--allowedTools", *allowed_tools]
+    res = run(*args, stdin=prompt).strip()
+    print(res)
+    if _needs_attention_token in res:
+        raise Exception(f"Error during prompt: {prompt}.\nResponse: {res}")
+    return res
+
+
+def enrich(org_path: Path, files: list[ChangedFile]):
+    files_to_enrich = [f for f in files if f.changed > SUMMARY_THRESHOLD] + [
         hunk for f in files for hunk in f.hunks if hunk.changed > SUMMARY_THRESHOLD
     ]
-    if not needs_summary:
+    if not files_to_enrich:
         print("nothing to enrich")
         return
-    claude = shutil.which("claude")
-    if claude is None:
-        sys.exit("claude CLI not found on PATH; rerun with --no-enrich or install Claude Code")
+
     before = org_path.read_text().splitlines()
-    output = run(
-        claude, "-p", "--model", ENRICH_MODEL, "--allowedTools", "Read", "Edit",
-        stdin=enrich_prompt(org_path, files),
-    )
-    print(output.strip())
+    claude(summary_prompt(org_path, files), "Read", "Edit")
     after = org_path.read_text().splitlines()
     if not keeps_lines(before, after):
         print(
@@ -213,8 +232,16 @@ def enrich(org_path: Path, files: list[ChangedFile]) -> None:
             file=sys.stderr,
         )
 
+    claude(f"""
+You are enriching the org document at {org_path}. It is an emacs-org view of the code changes in a github pull request.
 
-def main() -> None:
+Read the whole document first, then edit it in place with the Edit tool. Change only what is listed below.
+
+Within each file heading, categorize each diff source block as containing trivial or significant changes. Trivial changes are any where no logic was changed. For example the change is simply a change in imports or a rename. Group all trivial changes within that file under a new `trivial changes` subheading.
+""".strip(), "Read", "Edit")
+
+
+def main():
     parser = argparse.ArgumentParser(description="Build and enrich a PR code-changes org document.")
     parser.add_argument("pr", nargs="?", help="PR number; defaults to the current branch's PR")
     parser.add_argument("--out", type=Path, help="output path; defaults to the repo root")
