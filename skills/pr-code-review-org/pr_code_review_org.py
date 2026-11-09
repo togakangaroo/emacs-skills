@@ -16,6 +16,8 @@ Usage:
 
 import argparse
 import json
+import logging
+import os
 import re
 import shutil
 import subprocess
@@ -25,7 +27,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from functools import cache
 from pathlib import Path
-from typing import Final
+from typing import Final, NoReturn
+
+log = logging.getLogger("pr_code_review_org")
 
 ENRICH_MODEL = "claude-haiku-5-5"
 SUMMARY_THRESHOLD = 10
@@ -73,13 +77,20 @@ def hunk_key(changed_file: ChangedFile, hunk: Hunk) -> str:
     return f"{changed_file.path}|{hunk.label}"
 
 
+def fail(message: str) -> NoReturn:
+    log.error(message)
+    sys.exit(1)
+
+
 def run(*args: str, stdin: str | None = None, timeout: float = GH_TIMEOUT) -> str:
+    log.debug("running %s (timeout %gs)", " ".join(args), timeout)
     try:
         result = subprocess.run(args, capture_output=True, text=True, input=stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
-        sys.exit(f"{args[0]} timed out after {timeout:g}s")
+        fail(f"{args[0]} timed out after {timeout:g}s")
     if result.returncode != 0:
-        sys.exit(f"{args[0]} failed: {result.stderr.strip()}")
+        fail(f"{args[0]} failed: {result.stderr.strip()}")
+    log.debug("%s exited 0 with %d chars of output", args[0], len(result.stdout))
     return result.stdout
 
 
@@ -92,7 +103,9 @@ def pr_metadata(number: str | None) -> dict[str, object]:
 def gh_lines(endpoint: str) -> list[dict]:
     # --jq applies per page, so each item comes out on its own line across pages.
     out = run("gh", "api", "--paginate", "--jq", ".[]", endpoint)
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
+    items = [json.loads(line) for line in out.splitlines() if line.strip()]
+    log.debug("fetched %d items from %s", len(items), endpoint)
+    return items
 
 
 def parse_diff(diff: str) -> list[ChangedFile]:
@@ -124,14 +137,15 @@ def parse_diff(diff: str) -> list[ChangedFile]:
 def check_checkout(head_oid: str, root: Path) -> None:
     local_oid = run("git", "-C", str(root), "rev-parse", "HEAD").strip()
     if local_oid != head_oid:
-        print(
-            f"warning: local HEAD {local_oid[:12]} is not the PR head {head_oid[:12]}; "
-            "line links point at the local checkout, so check out the PR branch first",
-            file=sys.stderr,
+        log.warning(
+            "local HEAD %s is not the PR head %s; line links point at the local checkout, "
+            "so check out the PR branch first",
+            local_oid[:12],
+            head_oid[:12],
         )
     dirty = run("git", "-C", str(root), "status", "--porcelain", "--untracked-files=no")
     if dirty.strip():
-        print("warning: tracked files have uncommitted changes; line links may be off", file=sys.stderr)
+        log.warning("tracked files have uncommitted changes; line links may be off")
 
 
 Placed = dict[tuple[str, str], list[tuple[int | None, list[dict]]]]
@@ -166,6 +180,8 @@ def place_threads(files: list[ChangedFile], review: list[dict], issue: list[dict
         placed.setdefault((kind, key), []).append((line, thread))
     for comment in issue:
         placed.setdefault(("discussion", ""), []).append((None, [comment]))
+    for (kind, key), entries in placed.items():
+        log.debug("placed %d thread(s) under %s %s", len(entries), kind, key or "(top level)")
     return placed
 
 
@@ -347,7 +363,7 @@ ENRICH_PROMPTS: list[Callable[[list[ChangedFile]], str]] = [
 def claude_path() -> str:
     path = shutil.which("claude")
     if path is None:
-        sys.exit("claude CLI not found on PATH; rerun with --no-enrich or install Claude Code")
+        fail("claude CLI not found on PATH; rerun with --no-enrich or install Claude Code")
     return path
 
 
@@ -357,54 +373,59 @@ If the operation fails or gets confusing, reply with the following token, a new 
 """.rstrip()
     # No tools are allowed, and dontAsk refuses any tool use, so Haiku can only reply with text.
     args = [claude_path(), "-p", "--model", ENRICH_MODEL, "--permission-mode", "dontAsk", "--permission-prompts", "none"]
+    log.debug("sending %d-char prompt to %s", len(prompt), ENRICH_MODEL)
     res = run(*args, stdin=prompt, timeout=CLAUDE_TIMEOUT).strip()
     if _needs_attention_token in res:
         reason = res.split(_needs_attention_token, 1)[1].strip() or "no reason given"
         raise Exception(f"Haiku needs attention: {reason}")
+    log.debug("Haiku replied with %d chars", len(res))
     return res
 
 
 def parse_json_object(text: str) -> dict:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
-        sys.exit(f"expected a JSON object from Haiku; got: {text[:300]}")
+        fail(f"expected a JSON object from Haiku; got: {text[:300]}")
     try:
         return json.loads(text[start : end + 1])
     except json.JSONDecodeError as error:
-        sys.exit(f"could not parse Haiku's JSON: {error}")
+        fail(f"could not parse Haiku's JSON: {error}")
 
 
 def enrich(files: list[ChangedFile]) -> dict[str, dict]:
     if not files:
-        print("nothing to enrich")
+        log.info("nothing to enrich")
         return {}
     enrichment: dict[str, dict] = {}
     for prompt in ENRICH_PROMPTS:
+        log.info("running enrichment prompt %s", prompt.__name__)
         reply = parse_json_object(claude(prompt(files)))
         for section, values in reply.items():
             if isinstance(values, dict):
+                log.debug("section %s: %d entries", section, len(values))
                 enrichment.setdefault(section, {}).update(values)
     return enrichment
 
 
 def sort_trivial_last(org_path: Path) -> None:
     if shutil.which("emacsclient") is None:
-        print("warning: emacsclient not found; leaving files unsorted", file=sys.stderr)
+        log.warning("emacsclient not found; leaving files unsorted")
         return
     elisp = Path(__file__).with_name("sort-trivial-last.el")
     form = (
         f"(progn (load-file {json.dumps(str(elisp))}) "
         f"(pr-code-review-org-sort-trivial-last {json.dumps(str(org_path))}))"
     )
+    log.debug("sorting with emacsclient: %s", form)
     try:
         result = subprocess.run(
             ["emacsclient", "--eval", form], capture_output=True, text=True, timeout=EMACSCLIENT_TIMEOUT
         )
     except subprocess.TimeoutExpired:
-        print(f"warning: sorting timed out after {EMACSCLIENT_TIMEOUT}s; leaving files unsorted", file=sys.stderr)
+        log.warning("sorting timed out after %ss; leaving files unsorted", EMACSCLIENT_TIMEOUT)
         return
     if result.returncode != 0:
-        print(f"warning: could not sort trivial changes last: {result.stderr.strip()}", file=sys.stderr)
+        log.warning("could not sort trivial changes last: %s", result.stderr.strip())
 
 
 def main():
@@ -414,12 +435,19 @@ def main():
     parser.add_argument("--no-enrich", action="store_true", help="skip the Haiku enrichment step")
     parser.add_argument("--open", action="store_true", default=True, help="open the document in Emacs")
     args = parser.parse_args()
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    if level not in logging.getLevelNamesMapping():
+        level = "INFO"
+        log.warning("unknown LOG_LEVEL %r; using INFO", os.environ["LOG_LEVEL"])
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
 
     root = Path(run("git", "rev-parse", "--show-toplevel").strip())
     meta = pr_metadata(args.pr)
     number = str(meta["number"])
+    log.info("PR #%s: %s", number, meta["title"])
     check_checkout(str(meta["headRefOid"]), root)
     files = parse_diff(run("gh", "pr", "diff", number, "--color", "never"))
+    log.info("%d files, %d hunks", len(files), sum(len(f.hunks) for f in files))
     placed = place_threads(
         files,
         gh_lines(f"repos/:owner/:repo/pulls/{number}/comments"),
@@ -431,11 +459,14 @@ def main():
     (out_path.parent / ".gitignore").write_text("*\n")
     # Write the structure first, so a failed enrichment still leaves a usable document.
     out_path.write_text(render(meta, files, root, {}, placed))
+    log.info("wrote structure to %s", out_path)
 
     if not args.no_enrich:
         enrichment = enrich(files)
         out_path.write_text(render(meta, files, root, enrichment, placed))
+        log.info("wrote enriched document to %s", out_path)
         sort_trivial_last(out_path)
+    # The path is the script's output, so it stays on stdout; progress and warnings go through logging.
     print(out_path)
     if args.open:
         run("emacsclient", "-n", str(out_path), timeout=EMACSCLIENT_TIMEOUT)
