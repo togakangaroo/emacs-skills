@@ -24,7 +24,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from functools import cache
 from pathlib import Path
 from typing import Final, NoReturn
@@ -428,12 +428,30 @@ def sort_trivial_last(org_path: Path) -> None:
         log.warning("could not sort trivial changes last: %s", result.stderr.strip())
 
 
+def fetch_replies(number: str, meta: dict[str, object] | None = None) -> dict:
+    meta = meta or pr_metadata(number)
+    return {
+        "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "pr": meta,
+        "diff": run("gh", "pr", "diff", number, "--color", "never"),
+        "review_comments": gh_lines(f"repos/:owner/:repo/pulls/{number}/comments"),
+        "issue_comments": gh_lines(f"repos/:owner/:repo/issues/{number}/comments"),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build and enrich a PR code-changes org document.")
     parser.add_argument("pr", nargs="?", help="PR number; defaults to the current branch's PR")
     parser.add_argument("--out", type=Path, help="output path; defaults to <repo root>/.reviews/")
     parser.add_argument("--no-enrich", action="store_true", help="skip the Haiku enrichment step")
-    parser.add_argument("--open", action="store_true", default=True, help="open the document in Emacs")
+    parser.add_argument(
+        "--reuse-data",
+        action="store_true",
+        help="use the cached GitHub replies next to the output instead of querying gh again",
+    )
+    parser.add_argument(
+        "--open", action=argparse.BooleanOptionalAction, default=True, help="open the document in Emacs (default; --no-open to skip)"
+    )
     args = parser.parse_args()
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     if level not in logging.getLevelNamesMapping():
@@ -442,21 +460,40 @@ def main():
     logging.basicConfig(level=level, format="%(levelname)s %(message)s")
 
     root = Path(run("git", "rev-parse", "--show-toplevel").strip())
-    meta = pr_metadata(args.pr)
-    number = str(meta["number"])
-    log.info("PR #%s: %s", number, meta["title"])
-    check_checkout(str(meta["headRefOid"]), root)
-    files = parse_diff(run("gh", "pr", "diff", number, "--color", "never"))
-    log.info("%d files, %d hunks", len(files), sum(len(f.hunks) for f in files))
-    placed = place_threads(
-        files,
-        gh_lines(f"repos/:owner/:repo/pulls/{number}/comments"),
-        gh_lines(f"repos/:owner/:repo/issues/{number}/comments"),
-    )
 
+    # Without a PR argument, the current branch's PR number names the output files.
+    known_meta = None
+    number = args.pr
+    if number is None:
+        known_meta = pr_metadata(None)
+        number = str(known_meta["number"])
     out_path = args.out or root / ".reviews" / f"pr-{number}-code-changes.org"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     (out_path.parent / ".gitignore").write_text("*\n")
+    cache_path = out_path.with_suffix(".cache.json")
+
+    # Query GitHub up front, so every gh reply is in hand before any building or enrichment starts.
+    if args.reuse_data and cache_path.exists():
+        try:
+            replies = json.loads(cache_path.read_text())
+        except json.JSONDecodeError as error:
+            fail(f"could not read cached GitHub replies at {cache_path}: {error}")
+        log.info("reusing GitHub replies from %s (fetched %s)", cache_path, replies["fetched_at"])
+    else:
+        replies = fetch_replies(number, known_meta)
+        cache_path.write_text(json.dumps(replies, indent=2))
+        log.info("saved GitHub replies to %s", cache_path)
+
+    meta = replies["pr"]
+    diff = replies["diff"]
+    review = replies["review_comments"]
+    issue = replies["issue_comments"]
+    log.info("PR #%s: %s", number, meta["title"])
+
+    check_checkout(str(meta["headRefOid"]), root)
+    files = parse_diff(diff)
+    log.info("%d files, %d hunks", len(files), sum(len(f.hunks) for f in files))
+    placed = place_threads(files, review, issue)
     # Write the structure first, so a failed enrichment still leaves a usable document.
     out_path.write_text(render(meta, files, root, {}, placed))
     log.info("wrote structure to %s", out_path)

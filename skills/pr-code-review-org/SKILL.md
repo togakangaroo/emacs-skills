@@ -14,13 +14,14 @@ Produce an Emacs org document of a pull request's code changes. Each changed fil
 1. **Confirm the working directory is a git checkout of the PR.** The script must run inside the repo. Line links point at the local working tree, so the PR branch should be checked out. If the user names a PR that isn't checked out, say so and ask whether to check it out before continuing. Do not switch branches on your own.
 2. **Run the script** from the repo:
    ```sh
-   uv run "$CLAUDE_PLUGIN_ROOT/skills/pr-code-review-org/pr_code_review_org.py" [PR_NUMBER] [--out PATH] [--no-enrich] [--open]
+   uv run "$CLAUDE_PLUGIN_ROOT/skills/pr-code-review-org/pr_code_review_org.py" [PR_NUMBER] [--out PATH] [--no-enrich] [--reuse-data] [--no-open]
    ```
    If `$CLAUDE_PLUGIN_ROOT` is unset, use this skill's own directory path.
    - `PR_NUMBER`: optional. Defaults to the current branch's PR, resolved by `gh`.
    - `--no-enrich`: build only. No summaries, no `claude` call. Use it when the user wants the structure fast or has no `claude` CLI.
    - `--out PATH`: output path. Leave it unset to use `<repo root>/.reviews/pr-<n>-code-changes.org`. The script creates `.reviews/` and writes a `.gitignore` containing `*` there, so the document stays out of commits without touching the root `.gitignore`. Do not pass a path under `.claude/`: writes there are refused as sensitive, which blocks the summary step.
-   - `--open`: open the document in Emacs via `emacsclient -n`. Pass it only when the user asks to open it.
+   - `--reuse-data`: use the `.cache.json` saved next to the document, if it exists, instead of querying `gh`. Use it to rebuild or re-enrich a document without new GitHub calls, for example after a comment-placement change. Without it, the script always queries GitHub and rewrites the cache.
+   - `--no-open`: the document opens in Emacs via `emacsclient -n` by default. Pass `--no-open` when the user doesn't want it opened.
 3. **Report the result.** The script prints the output path on stdout. Give the user that full absolute path, and surface any stderr warnings verbatim.
 
 ## Enrichment
