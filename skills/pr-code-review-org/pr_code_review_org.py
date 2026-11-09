@@ -116,39 +116,38 @@ def check_checkout(head_oid: str, root: Path) -> None:
         print("warning: tracked files have uncommitted changes; line links may be off", file=sys.stderr)
 
 
-def render(meta: dict[str, object], files: list[ChangedFile], root: Path) -> str:
+def _render(meta: dict[str, object], files: list[ChangedFile], root: Path):
     number = meta["number"]
-    parts = [
-        f"""
+    yield f"""
 #+title: PR #{number}: {meta["title"]}
 #+date: {date.today():%Y-%m-%d}
 #+startup: overview
 
-{len(files)} files changed on ={meta["headRefName"]}= against ={meta["baseRefName"]}=, PR #{number}. Line links point to the local working tree.
+* Changes
 
+{len(files)} files changed on ={meta["headRefName"]}= against ={meta["baseRefName"]}=, PR #{number}. Line links point to the local working tree.
 """.lstrip()
-    ]
+
     for changed_file in files:
-        parts.append(
-            f"""
-* {changed_file.path}
+        yield f"""
+** {changed_file.path}
   Status: {changed_file.status}
 
 """.lstrip()
-        )
+
         for hunk in changed_file.hunks:
             link = f"file:{root}/{changed_file.path}::{hunk.start}"
             body = "\n".join(hunk.lines)
-            parts.append(
-                f"""
-** [[{link}][{hunk.label}]]
+            yield f"""
+*** [[{link}][{hunk.label}]]
 #+begin_src diff
 {body}
 #+end_src
 
 """.lstrip()
-            )
-    return "".join(parts)
+
+def render(meta: dict[str, object], files: list[ChangedFile], root: Path):
+    return "".join(_render(meta, files, root))
 
 _needs_attention_token: Final[str] = '<<<<NEEDS ATTENTION>>>'
 
@@ -203,15 +202,17 @@ def claude_path() -> str:
 
 def claude(prompt: str, *allowed_tools: str) -> str:
     prompt += f"""
-    If the operation fails or gets confusing simply reply with the following token: {_needs_attention_token}
+    If the operation fails or gets confusing, reply with the following token, a new line, and a reason: {_needs_attention_token}
     """.lstrip()
-    args = [claude_path(), "-p", "--model", ENRICH_MODEL]
+    # dontAsk refuses anything not in --allowedTools, so edits outside the allowed paths are denied.
+    args = [claude_path(), "-p", "--model", ENRICH_MODEL, "--permission-mode", "dontAsk", "--permission-prompts", "none"]
     if allowed_tools:
         args += ["--allowedTools", *allowed_tools]
     res = run(*args, stdin=prompt).strip()
     print(res)
     if _needs_attention_token in res:
-        raise Exception(f"Error during prompt: {prompt}.\nResponse: {res}")
+        reason = res.split(_needs_attention_token, 1)[1].strip() or "no reason given"
+        raise Exception(f"Error during prompt: {prompt}.\nReason: {reason}")
     return res
 
 
@@ -224,7 +225,8 @@ def enrich(org_path: Path, files: list[ChangedFile]):
         return
 
     before = org_path.read_text().splitlines()
-    claude(summary_prompt(org_path, files), "Read", "Edit")
+    # Claude Code reads a single leading slash in an Edit rule as project-relative, so use //.
+    claude(summary_prompt(org_path, files), "Read", f"Edit(/{org_path})")
     after = org_path.read_text().splitlines()
     if not keeps_lines(before, after):
         print(
@@ -238,15 +240,29 @@ You are enriching the org document at {org_path}. It is an emacs-org view of the
 Read the whole document first, then edit it in place with the Edit tool. Change only what is listed below.
 
 Within each file heading, categorize each diff source block as containing trivial or significant changes. Trivial changes are any where no logic was changed. For example the change is simply a change in imports or a rename. Group all trivial changes within that file under a new `trivial changes` subheading.
-""".strip(), "Read", "Edit")
+""".strip(), "Read", f"Edit(/{org_path})")
+
+
+def sort_trivial_last(org_path: Path) -> None:
+    if shutil.which("emacsclient") is None:
+        print("warning: emacsclient not found; leaving files unsorted", file=sys.stderr)
+        return
+    elisp = Path(__file__).with_name("sort-trivial-last.el")
+    form = (
+        f"(progn (load-file {json.dumps(str(elisp))}) "
+        f"(pr-code-review-org-sort-trivial-last {json.dumps(str(org_path))}))"
+    )
+    result = subprocess.run(["emacsclient", "--eval", form], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"warning: could not sort trivial changes last: {result.stderr.strip()}", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build and enrich a PR code-changes org document.")
     parser.add_argument("pr", nargs="?", help="PR number; defaults to the current branch's PR")
-    parser.add_argument("--out", type=Path, help="output path; defaults to the repo root")
+    parser.add_argument("--out", type=Path, help="output path; defaults to <repo root>/.reviews/")
     parser.add_argument("--no-enrich", action="store_true", help="skip the Haiku enrichment step")
-    parser.add_argument("--open", action="store_true", help="open the document in Emacs")
+    parser.add_argument("--open", action="store_true", default=True, help="open the document in Emacs")
     args = parser.parse_args()
 
     root = Path(run("git", "rev-parse", "--show-toplevel").strip())
@@ -255,12 +271,15 @@ def main():
     check_checkout(str(meta["headRefOid"]), root)
     files = parse_diff(run("gh", "pr", "diff", number, "--color", "never"))
 
-    out_path = args.out or root / f"pr-{number}-code-changes.org"
+    out_path = args.out or root / ".reviews" / f"pr-{number}-code-changes.org"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    (out_path.parent / ".gitignore").write_text("*\n")
     out_path.write_text(render(meta, files, root))
     print(out_path)
 
     if not args.no_enrich:
         enrich(out_path, files)
+        sort_trivial_last(out_path)
     if args.open:
         run("emacsclient", "-n", str(out_path))
 

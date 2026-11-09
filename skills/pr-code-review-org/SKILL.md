@@ -19,13 +19,15 @@ Produce an Emacs org document of a pull request's code changes. Each changed fil
    If `$CLAUDE_PLUGIN_ROOT` is unset, use this skill's own directory path.
    - `PR_NUMBER`: optional. Defaults to the current branch's PR, resolved by `gh`.
    - `--no-enrich`: build only. No summaries, no `claude` call. Use it when the user wants the structure fast or has no `claude` CLI.
-   - `--out PATH`: output path. Always pass it. Consider using `<repo root>/.claude/reviews/pr-<n>-code-changes.org`, so the document stays out of commits. Before running, create the folder if it is missing and write a `.gitignore` in it containing a single `*` line, so the folder ignores itself without touching the repo's root `.gitignore`. Do not put the document at the repo root.
+   - `--out PATH`: output path. Leave it unset to use `<repo root>/.reviews/pr-<n>-code-changes.org`. The script creates `.reviews/` and writes a `.gitignore` containing `*` there, so the document stays out of commits without touching the root `.gitignore`. Do not pass a path under `.claude/`: writes there are refused as sensitive, which blocks the summary step.
    - `--open`: open the document in Emacs via `emacsclient -n`. Pass it only when the user asks to open it.
 3. **Report the result.** The script prints the output path on stdout. Give the user that full absolute path, and surface any stderr warnings verbatim.
 
 ## Enrichment
 
 Unless `--no-enrich` is passed, the script runs `claude -p --model claude-haiku-5-5` (with Read and Edit allowed) on the document. It adds 1–3 sentence summaries to files, and 1–4 sentence summaries to hunks, that have more than 10 changed (`+`/`-`) lines. The script checks that no original line was removed or reordered and warns on stderr if one was.
+
+Then the script runs `sort-trivial-last.el` through `emacsclient` (this needs a running Emacs server, and it only warns if the step fails). It moves files whose only subheading is `trivial changes` to the end of the `Changes` section.
 
 Summaries are Haiku output and have not been reviewed for accuracy. Say so when you hand the document over. If the user needs a summary to be right, they should read the diff.
 
