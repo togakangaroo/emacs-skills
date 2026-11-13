@@ -26,11 +26,13 @@ Produce an Emacs org document of a pull request's code changes. Each changed fil
 
 ## Enrichment
 
-Unless `--no-enrich` is passed, the script sends each prompt in `ENRICH_PROMPTS` to `claude -p --model claude-haiku-5-5` with no tools allowed. Haiku replies with JSON only: 1–3 sentence summaries for files and 1–4 sentence summaries for hunks with more than 10 changed (`+`/`-`) lines, and a trivial/significant flag for each hunk. Haiku never writes to the file. The script renders the document from those replies, so there is no in-place editing to get refused.
+Unless `--no-enrich` is passed, the script sends each prompt in `ENRICH_PROMPTS` to `claude -p --model claude-haiku-5-5` with no tools allowed. Haiku replies with JSON only: 1–3 sentence summaries for files and 1–4 sentence summaries for hunks with more than 10 changed (`+`/`-`) lines, a trivial/significant flag for each hunk, and a 0–100 pertinence score for each file. Haiku never writes to the file. The script renders the document from those replies, so there is no in-place editing to get refused.
+
+Rendering then applies those results:
+- Files are ordered by pertinence, most central to the PR first. Hunks within a file keep their diff order.
+- A file whose hunks are all trivial goes under a `** Trivial Changes Only` heading at the end of `Changes`. Within a mixed file, trivial hunks go under a `trivial changes` subheading.
 
 PR comment threads are fetched with `gh api`. A review thread appears inline, directly after the diff line it refers to, and each comment links back to its PR comment. A comment whose line isn't in any hunk goes under its file, and conversation comments go under a `Discussion` section. They are rendered as quote blocks, not headings, so they don't affect the structure.
-
-Then the script runs `sort-trivial-last.el` through `emacsclient` (this needs a running Emacs server, and it only warns if the step fails). It moves files whose only subheading is `trivial changes` to the end of the `Changes` section.
 
 Each external call has a timeout (`gh` 120s, `claude` 900s, `emacsclient` 60s). A timeout exits with a message that names the step.
 

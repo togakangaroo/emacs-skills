@@ -246,6 +246,55 @@ def render_hunk(
     return "".join(out)
 
 
+def is_trivial_only(changed_file: ChangedFile, enrichment: dict[str, dict]) -> bool:
+    trivial = enrichment.get("trivial", {})
+    return bool(changed_file.hunks) and all(
+        trivial.get(hunk_key(changed_file, hunk)) is True for hunk in changed_file.hunks
+    )
+
+
+def ordered_files(files: list[ChangedFile], enrichment: dict[str, dict]) -> list[ChangedFile]:
+    # Most pertinent first. sorted() is stable, so files without a score keep their diff order.
+    scores = enrichment.get("pertinence", {})
+
+    def score(changed_file: ChangedFile) -> float:
+        value = scores.get(changed_file.path)
+        return value if isinstance(value, (int, float)) else 0
+
+    return sorted(files, key=lambda changed_file: -score(changed_file))
+
+
+def render_file(
+    changed_file: ChangedFile,
+    stars: str,
+    root: Path,
+    enrichment: dict[str, dict],
+    placed: Placed,
+) -> str:
+    hunk_stars = stars + "*"
+    out = [f"{stars} {changed_file.path}\n  Status: {changed_file.status}\n"]
+    if summary := enrichment.get("files", {}).get(changed_file.path):
+        out.append(f"\n{summary}\n")
+    out.append("\n")
+    out += [render_thread(thread) for _, thread in placed.get(("file", changed_file.path), [])]
+
+    if is_trivial_only(changed_file, enrichment):
+        out += [render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed) for hunk in changed_file.hunks]
+        return "".join(out)
+
+    trivial = enrichment.get("trivial", {})
+    is_trivial = [trivial.get(hunk_key(changed_file, hunk)) is True for hunk in changed_file.hunks]
+    for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
+        if not trivial_hunk:
+            out.append(render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed))
+    if any(is_trivial):
+        out.append(f"{hunk_stars} trivial changes\n\n")
+        for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
+            if trivial_hunk:
+                out.append(render_hunk(changed_file, hunk, hunk_stars + "*", root, enrichment, placed))
+    return "".join(out)
+
+
 def render(
     meta: dict[str, object],
     files: list[ChangedFile],
@@ -265,23 +314,15 @@ def render(
 {len(files)} files changed on ={meta["headRefName"]}= against ={meta["baseRefName"]}=, PR #{number}. Line links point to the local working tree.
 """.lstrip()
     ]
-    for changed_file in files:
-        parts.append(f"** {changed_file.path}\n  Status: {changed_file.status}\n")
-        if summary := enrichment.get("files", {}).get(changed_file.path):
-            parts.append(f"\n{summary}\n")
-        parts.append("\n")
-        parts += [render_thread(thread) for _, thread in placed.get(("file", changed_file.path), [])]
-
-        trivial = enrichment.get("trivial", {})
-        is_trivial = [trivial.get(hunk_key(changed_file, hunk)) is True for hunk in changed_file.hunks]
-        for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
-            if not trivial_hunk:
-                parts.append(render_hunk(changed_file, hunk, "***", root, enrichment, placed))
-        if any(is_trivial):
-            parts.append("*** trivial changes\n\n")
-            for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
-                if trivial_hunk:
-                    parts.append(render_hunk(changed_file, hunk, "****", root, enrichment, placed))
+    ordered = ordered_files(files, enrichment)
+    main_files = [f for f in ordered if not is_trivial_only(f, enrichment)]
+    trivial_files = [f for f in ordered if is_trivial_only(f, enrichment)]
+    for changed_file in main_files:
+        parts.append(render_file(changed_file, "**", root, enrichment, placed))
+    if trivial_files:
+        parts.append("** Trivial Changes Only\n\n")
+        for changed_file in trivial_files:
+            parts.append(render_file(changed_file, "***", root, enrichment, placed))
 
     if discussion := placed.get(("discussion", "")):
         parts.append("* Discussion\n\n")
@@ -353,9 +394,32 @@ Hunk keys:
 
 # Each entry takes the changed files and returns a prompt whose reply is a JSON object.
 # Top-level sections of the replies are merged, so new prompts can add sections of their own.
+def pertinence_prompt(files: list[ChangedFile]) -> str:
+    file_lines = "\n".join(f"- {f.path} ({f.changed} changed lines)" for f in files) or "- none"
+    return f"""
+You are ranking the files changed by a pull request by how much they matter to understanding its core change.
+    - Files that modify the shape of data structures used throughout rank highest
+    - Then those that implement the main behavior the PR is about
+    - Rank changes in areas of more complex logic above changes in areas of less complex logic
+    - Tests, configuration, plumbing, and incidental edits rank lower
+    - If a file contains a significant comment or doc block explaining the new behavior rank that higher
+
+Give every file a score from 0 to 100, where 100 is the highest pertinence to understanding the PR.
+
+Files, with their changed-line counts:
+{file_lines}
+
+Reply with a JSON object of this shape, with one entry for every file listed:
+{{"pertinence": {{"<path>": 75}}}}
+{JSON_REPLY}
+
+{diff_listing(files)}""".lstrip()
+
+
 ENRICH_PROMPTS: list[Callable[[list[ChangedFile]], str]] = [
     summary_prompt,
     triviality_prompt,
+    pertinence_prompt,
 ]
 
 
@@ -405,27 +469,6 @@ def enrich(files: list[ChangedFile]) -> dict[str, dict]:
                 log.debug("section %s: %d entries", section, len(values))
                 enrichment.setdefault(section, {}).update(values)
     return enrichment
-
-
-def sort_trivial_last(org_path: Path) -> None:
-    if shutil.which("emacsclient") is None:
-        log.warning("emacsclient not found; leaving files unsorted")
-        return
-    elisp = Path(__file__).with_name("sort-trivial-last.el")
-    form = (
-        f"(progn (load-file {json.dumps(str(elisp))}) "
-        f"(pr-code-review-org-sort-trivial-last {json.dumps(str(org_path))}))"
-    )
-    log.debug("sorting with emacsclient: %s", form)
-    try:
-        result = subprocess.run(
-            ["emacsclient", "--eval", form], capture_output=True, text=True, timeout=EMACSCLIENT_TIMEOUT
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("sorting timed out after %ss; leaving files unsorted", EMACSCLIENT_TIMEOUT)
-        return
-    if result.returncode != 0:
-        log.warning("could not sort trivial changes last: %s", result.stderr.strip())
 
 
 def fetch_replies(number: str, meta: dict[str, object] | None = None) -> dict:
@@ -502,7 +545,6 @@ def main():
         enrichment = enrich(files)
         out_path.write_text(render(meta, files, root, enrichment, placed))
         log.info("wrote enriched document to %s", out_path)
-        sort_trivial_last(out_path)
     # The path is the script's output, so it stays on stdout; progress and warnings go through logging.
     print(out_path)
     if args.open:
