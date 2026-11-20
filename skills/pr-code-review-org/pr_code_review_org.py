@@ -197,8 +197,8 @@ def render_thread(thread: list[dict]) -> str:
     return f"#+begin_quote\n{indented}\n#+end_quote\n\n"
 
 
-def diff_block(lines: list[str]) -> str:
-    return "#+begin_src diff\n" + "\n".join(lines) + "\n#+end_src\n"
+def diff_block(lines: list[str], src_lang: str) -> str:
+    return f"#+begin_src {src_lang}\n" + "\n".join(lines) + "\n#+end_src\n"
 
 
 def render_hunk(
@@ -208,6 +208,7 @@ def render_hunk(
     root: Path,
     enrichment: dict[str, dict],
     placed: Placed,
+    src_lang: str,
 ) -> str:
     key = hunk_key(changed_file, hunk)
     link = f"file:{root}/{changed_file.path}::{hunk.start}"
@@ -234,11 +235,11 @@ def render_hunk(
             new_line += 1
         threads = at_line.pop(current, []) if current is not None else []
         if threads:
-            out.append(diff_block(block))
+            out.append(diff_block(block, src_lang))
             block = []
             out += [render_thread(thread) for thread in threads]
     if block:
-        out.append(diff_block(block))
+        out.append(diff_block(block, src_lang))
     for threads in at_line.values():
         leftover += threads
     out += [render_thread(thread) for thread in leftover]
@@ -270,6 +271,7 @@ def render_file(
     root: Path,
     enrichment: dict[str, dict],
     placed: Placed,
+    src_lang: str,
 ) -> str:
     hunk_stars = stars + "*"
     out = [f"{stars} {changed_file.path}\n  Status: {changed_file.status}\n"]
@@ -279,19 +281,19 @@ def render_file(
     out += [render_thread(thread) for _, thread in placed.get(("file", changed_file.path), [])]
 
     if is_trivial_only(changed_file, enrichment):
-        out += [render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed) for hunk in changed_file.hunks]
+        out += [render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed, src_lang) for hunk in changed_file.hunks]
         return "".join(out)
 
     trivial = enrichment.get("trivial", {})
     is_trivial = [trivial.get(hunk_key(changed_file, hunk)) is True for hunk in changed_file.hunks]
     for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
         if not trivial_hunk:
-            out.append(render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed))
+            out.append(render_hunk(changed_file, hunk, hunk_stars, root, enrichment, placed, src_lang))
     if any(is_trivial):
         out.append(f"{hunk_stars} trivial changes\n\n")
         for hunk, trivial_hunk in zip(changed_file.hunks, is_trivial):
             if trivial_hunk:
-                out.append(render_hunk(changed_file, hunk, hunk_stars + "*", root, enrichment, placed))
+                out.append(render_hunk(changed_file, hunk, hunk_stars + "*", root, enrichment, placed, src_lang))
     return "".join(out)
 
 
@@ -301,6 +303,7 @@ def render(
     root: Path,
     enrichment: dict[str, dict],
     placed: Placed,
+    src_lang: str,
 ) -> str:
     number = meta["number"]
     parts = [
@@ -318,11 +321,11 @@ def render(
     main_files = [f for f in ordered if not is_trivial_only(f, enrichment)]
     trivial_files = [f for f in ordered if is_trivial_only(f, enrichment)]
     for changed_file in main_files:
-        parts.append(render_file(changed_file, "**", root, enrichment, placed))
+        parts.append(render_file(changed_file, "**", root, enrichment, placed, src_lang))
     if trivial_files:
         parts.append("** Trivial Changes Only\n\n")
         for changed_file in trivial_files:
-            parts.append(render_file(changed_file, "***", root, enrichment, placed))
+            parts.append(render_file(changed_file, "***", root, enrichment, placed, src_lang))
 
     if discussion := placed.get(("discussion", "")):
         parts.append("* Discussion\n\n")
@@ -379,7 +382,10 @@ def triviality_prompt(files: list[ChangedFile]) -> str:
     keys = [hunk_key(changed_file, hunk) for changed_file in files for hunk in changed_file.hunks]
     key_lines = "\n".join(f"- {key}" for key in keys) or "- none"
     return f"""
-For each hunk below, decide whether it is trivial. A hunk is trivial when no logic changed, for example only imports changed, or only a rename. Anything else is significant.
+For each hunk below, decide whether it is trivial. A hunk is trivial when
+    - only imports changed
+    - it only contains a rename
+    - it is simply adding a parameter or passing through an argument with no logic *except* in the case of public endpoints, temporal activities or workflows. Where adding a parameter might cause a non-determinism error it is not trivial
 
 Reply with a JSON object of this shape, with one entry for every hunk key listed below:
 {{"trivial": {{"<hunk key>": true}}}}
@@ -421,6 +427,21 @@ ENRICH_PROMPTS: list[Callable[[list[ChangedFile]], str]] = [
     triviality_prompt,
     pertinence_prompt,
 ]
+
+
+@cache
+def load_diff_mode() -> None:
+    """Load python-diff-mode into the running Emacs, once per run, so org highlights python-diff blocks."""
+    elisp = Path(__file__).with_name("python-diff-mode.el")
+    form = f"(load-file {json.dumps(str(elisp))})"
+    log.debug("loading python-diff mode: %s", form)
+    try:
+        result = subprocess.run(["emacsclient", "--eval", form], capture_output=True, text=True, timeout=EMACSCLIENT_TIMEOUT)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        log.warning("could not load python-diff mode into Emacs: %s", error)
+        return
+    if result.returncode != 0:
+        log.warning("could not load python-diff mode into Emacs: %s", result.stderr.strip())
 
 
 @cache
@@ -493,6 +514,11 @@ def main():
         help="use the cached GitHub replies next to the output instead of querying gh again",
     )
     parser.add_argument(
+        "--src-lang",
+        default="python-diff",
+        help="org source block language for the diff hunks (default: python-diff; use diff for plain diff)",
+    )
+    parser.add_argument(
         "--open", action=argparse.BooleanOptionalAction, default=True, help="open the document in Emacs (default; --no-open to skip)"
     )
     args = parser.parse_args()
@@ -538,16 +564,17 @@ def main():
     log.info("%d files, %d hunks", len(files), sum(len(f.hunks) for f in files))
     placed = place_threads(files, review, issue)
     # Write the structure first, so a failed enrichment still leaves a usable document.
-    out_path.write_text(render(meta, files, root, {}, placed))
+    out_path.write_text(render(meta, files, root, {}, placed, args.src_lang))
     log.info("wrote structure to %s", out_path)
 
     if not args.no_enrich:
         enrichment = enrich(files)
-        out_path.write_text(render(meta, files, root, enrichment, placed))
+        out_path.write_text(render(meta, files, root, enrichment, placed, args.src_lang))
         log.info("wrote enriched document to %s", out_path)
     # The path is the script's output, so it stays on stdout; progress and warnings go through logging.
     print(out_path)
     if args.open:
+        load_diff_mode()
         run("emacsclient", "-n", str(out_path), timeout=EMACSCLIENT_TIMEOUT)
 
 
